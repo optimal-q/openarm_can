@@ -36,11 +36,18 @@ public:
     void close(double kp = 50.0, double kd = 1.0);
     void set_position(double position, double kp = 50.0, double kd = 1.0);
     void apply_force(double force);
+    void set_torque(double torque);
 
     damiao_motor::Motor* get_motor() const { return motor_.get(); }
     double get_measured_force() const { return motor_->get_torque(); }
     double get_measured_position() const {
         return motor_to_gripper_position(motor_->get_position());
+    }
+    double get_measured_velocity() const {
+        return motor_to_gripper_velocity(motor_->get_velocity());
+    }
+    double gripper_position_to_motor_position(double gripper_position) const {
+        return gripper_to_motor_position(gripper_position);
     }
 
 private:
@@ -63,6 +70,14 @@ private:
                    (motor_closed_position_ - motor_open_position_) *
                    (gripper_closed_position_ - gripper_open_position_) +
                gripper_open_position_;
+    }
+
+    double motor_to_gripper_velocity(double motor_velocity) const {
+        const double motor_range = motor_closed_position_ - motor_open_position_;
+        if (motor_range == 0.0) return 0.0;
+
+        // Velocity mapping derived from the position mapping above.
+        return motor_velocity * (gripper_closed_position_ - gripper_open_position_) / motor_range;
     }
 
     // Gripper configuration

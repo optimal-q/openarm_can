@@ -30,7 +30,6 @@ void Gripper::init_motor_device(damiao_motor::MotorType motor_type, uint32_t sen
 void Gripper::set_position(double position) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     desired_position_ = std::clamp(position, 0.0, 1.0);
-    mode_ = ControlMode::Position;
 }
 
 void Gripper::set_force(double max_effort) {
@@ -40,12 +39,15 @@ void Gripper::set_force(double max_effort) {
 
 Gripper::State Gripper::get_state() const {
     Gripper::State state{};
-    state.position = std::clamp(component_->get_measured_position(), 0.0, 1.0);
-    state.velocity = component_->get_motor()->get_velocity();
-    state.force = component_->get_measured_force();
+    const auto* motor = component_->get_motor();
+    if (motor) {
+        state.position = std::clamp(component_->get_measured_position(), 0.0, 1.0);
+        state.velocity = component_->get_measured_velocity();
+        state.force = component_->get_measured_force();
+    }
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        state.force_holding = mode_ == ControlMode::Force;
+        state.force_holding = force_holding_;
         state.max_effort = desired_max_effort_;
     }
     return state;
@@ -62,44 +64,68 @@ void Gripper::set_pid(double kp, double kd) {
 }
 
 void Gripper::update() {
+    static auto last_call = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto period = std::chrono::duration<double>(now - last_call).count();
+    // std::cout << "Gripper::update() calling period: " << period << " seconds" << std::endl;
+    last_call = now;
+
+    // 1) Read latest state first (unlocked).
+    const auto* motor = component_->get_motor();
+    if (!motor) return;
+
+    const double motor_position = motor->get_position();
+    const double motor_velocity = motor->get_velocity();
+
+    // Low-pass filter motor velocity for the PD velocity term.
+    // const double motor_velocity_for_control =
+    //     motor_velocity_filter_.update(motor_velocity, std::chrono::steady_clock::now());
+    const double motor_velocity_for_control = motor_velocity;
+
+    // 2) Fetch latest desired setpoints (locked).
     double cmd_position = 0.0;
-    double max_effort = 0.0;
-    ControlMode mode = ControlMode::Position;
+    double tau_max = 0.0;
+    double kp = 0.0;
+    double kd = 0.0;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         cmd_position = desired_position_;
-        max_effort = desired_max_effort_;
-        mode = mode_;
+        tau_max = desired_max_effort_;
+        kp = position_kp_;
+        kd = position_kd_;
     }
 
-    const double measured_force = component_->get_measured_force();
-    const double force_magnitude = std::abs(measured_force);
+    // 3) Outer-loop PD in motor coordinates; velocity target is zero.
+    const double motor_position_desired =
+        component_->gripper_position_to_motor_position(std::clamp(cmd_position, 0.0, 1.0));
 
-    // Force-limit logic with hysteresis.
-    const bool force_limit_enabled = max_effort > 0.0;
-    if (force_limit_enabled && force_magnitude > max_effort && mode == ControlMode::Position) {
-        mode = ControlMode::Force;
-    } else if (mode == ControlMode::Force) {
-        const double release_threshold = max_effort * hysteresis_ratio_;
-        if (!force_limit_enabled || force_magnitude < release_threshold) {
-            mode = ControlMode::Position;
-        }
+    const double position_error = motor_position_desired - motor_position;
+    const double velocity_error = -motor_velocity_for_control;
+    double tau_unclamped = kp * position_error + kd * velocity_error;
+    // std::cout << "tau_unclamped: " << tau_unclamped << std::endl;
+    // std::cout << "motor_velocity_for_control: " << motor_velocity_for_control << std::endl;
+    // std::cout << "kp: " << kp << std::endl;
+    // std::cout << "kd: " << kd << std::endl;
+    // std::cout << "position_error: " << position_error << std::endl;
+    // std::cout << "velocity_error: " << velocity_error << std::endl;
+    if (!std::isfinite(tau_unclamped)) {
+        tau_unclamped = 0.0;
     }
 
-    if (mode == ControlMode::Force && force_limit_enabled) {
-        const double sign =
-            (measured_force == 0.0) ? last_force_sign_ : (measured_force > 0.0 ? 1.0 : -1.0);
-        last_force_sign_ = sign;
-        component_->apply_force(sign * max_effort);
-    } else {
-        component_->set_position(cmd_position, position_kp_, position_kd_);
-        if (measured_force != 0.0) {
-            last_force_sign_ = measured_force > 0.0 ? 1.0 : -1.0;
-        }
-    }
+    // 4) Apply optional torque limiting.
+    const bool limit_enabled = std::isfinite(tau_max) && tau_max > 0.0;
+    const double tau_command =
+        limit_enabled ? std::clamp(tau_unclamped, -tau_max, tau_max) : tau_unclamped;
+    const bool torque_limited = limit_enabled && (tau_command != tau_unclamped);
 
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    mode_ = mode;
+    // 5) Always command torque (no mode switching).
+    component_->set_torque(tau_command);
+
+    // 6) Store reporting flags.
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        force_holding_ = torque_limited;
+    }
 }
 
 }  // namespace openarm::can::socket

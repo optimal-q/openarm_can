@@ -14,6 +14,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <mutex>
 
 #include "gripper_component.hpp"
@@ -21,15 +24,16 @@
 
 namespace openarm::can::socket {
 
-// High-level gripper wrapper that maintains position while respecting a force limit.
+// High-level gripper wrapper that tracks a position target using an outer-loop PD torque
+// controller with an optional torque limit.
 class Gripper {
 public:
     struct State {
         double position;      // measured gripper position
         double velocity;      // measured gripper velocity
-        double force;         // measured force/torque
-        bool force_holding;   // true if in force-limit mode
-        double max_effort;    // currently set maximum allowable effort
+        double force;         // measured torque
+        bool force_holding;   // true if torque is currently being limited
+        double max_effort;    // currently set maximum allowable torque (<=0 disables limiting)
     };
 
     explicit Gripper(canbus::CANSocket& can_socket);
@@ -58,21 +62,53 @@ public:
 private:
     friend class OpenArm;
 
-    enum class ControlMode { Position, Force };
-
     GripperComponent& component() { return *component_; }
 
     std::unique_ptr<GripperComponent> component_;
-    ControlMode mode_{ControlMode::Position};
+
+    struct FirstOrderLowPass {
+        double time_constant_s{0.02};
+
+        double update(double input, std::chrono::steady_clock::time_point now) {
+            if (!initialized) {
+                reset(input, now);
+                return state;
+            }
+
+            const std::chrono::duration<double> dt = now - last_time;
+            last_time = now;
+
+            const double dt_s = std::clamp(dt.count(), 0.0, 0.1);
+            const double tau_s = time_constant_s;
+            if (!(tau_s > 0.0) || !std::isfinite(tau_s)) {
+                state = input;
+                return state;
+            }
+
+            const double alpha = dt_s / (tau_s + dt_s);
+            state += alpha * (input - state);
+            return state;
+        }
+
+        void reset(double value, std::chrono::steady_clock::time_point now) {
+            state = value;
+            last_time = now;
+            initialized = true;
+        }
+
+    private:
+        bool initialized{false};
+        double state{0.0};
+        std::chrono::steady_clock::time_point last_time{};
+    };
 
     mutable std::mutex state_mutex_;
     double desired_position_{0.0};
-    double desired_max_effort_{10.0};
-    double position_kp_{10.0};
-    double position_kd_{1.0};
-
-    double last_force_sign_{1.0};
-    const double hysteresis_ratio_{0.9};
+    double desired_max_effort_{2};
+    double position_kp_{5.0};
+    double position_kd_{0.25};
+    bool force_holding_{false};
+    FirstOrderLowPass motor_velocity_filter_{};
 };
 
 }  // namespace openarm::can::socket

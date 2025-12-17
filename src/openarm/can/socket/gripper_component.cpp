@@ -47,10 +47,14 @@ void GripperComponent::set_position(double gripper_position, double kp, double k
 }
 
 void GripperComponent::apply_force(double force) {
+    set_torque(force);
+}
+
+void GripperComponent::set_torque(double torque) {
     if (!motor_device_) return;
 
     // Command constant torque while holding current position target.
     const double motor_position = motor_ ? motor_->get_position() : 0.0;
-    mit_control_one(0, damiao_motor::MITParam{0.0, 0.0, motor_position, 0.0, force});
+    mit_control_one(0, damiao_motor::MITParam{0.0, 0.0, motor_position, 0.0, torque});
 }
 }  // namespace openarm::can::socket
